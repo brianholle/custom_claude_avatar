@@ -1,11 +1,25 @@
 const fs = require('fs');
 const { avatars } = require('./avatars');
 
-// Minified variable names from the CLI bundle
-const CE = 'l9.createElement';
-const BOX = 'I';
-const TEXT = 'V';
-const FACE = 'q';
+// Auto-detect minified variable names from the CLI bundle
+function detectVariables(content) {
+    // Find the avatar pattern to extract variable names
+    // Using actual unicode characters instead of escape sequences
+    const avatarMatch = content.match(/([a-z0-9]+)\.createElement\((\w+),\{flexDirection:"column"\},(\w+),([a-z0-9]+)\.createElement\((\w+),null,([a-z0-9]+)\.createElement\((\w+),\{color:"clawd_body"\},"▝▜"\)/);
+
+    if (!avatarMatch) {
+        throw new Error('Could not detect avatar pattern. CLI structure may have changed significantly.');
+    }
+
+    const [, ceNamespace, box, face, , text] = avatarMatch;
+
+    return {
+        CE: `${ceNamespace}.createElement`,
+        BOX: box,
+        TEXT: text,
+        FACE: face
+    };
+}
 
 // --- Helpers ---
 
@@ -15,47 +29,53 @@ function propsString(props) {
     return `{${entries.join(',')}}`;
 }
 
-function compileLine(line) {
-    if (line.ref) {
-        return line.ref;
-    }
-    if (line.segments) {
-        const children = line.segments.map(seg => {
-            const props = { color: seg.color };
-            if (seg.backgroundColor) props.backgroundColor = seg.backgroundColor;
-            return `${CE}(${TEXT},${propsString(props)},"${seg.text}")`;
-        });
-        return `${CE}(${TEXT},null,${children.join(',')})`;
-    }
-    if (line.args) {
-        const argsStr = line.args.map(a => `"${a}"`).join(',');
-        return `${CE}(${TEXT},{color:"${line.color}"},${argsStr})`;
-    }
-    if (line.text !== undefined) {
-        const props = { color: line.color };
-        if (line.backgroundColor) props.backgroundColor = line.backgroundColor;
-        return `${CE}(${TEXT},${propsString(props)},"${line.text}")`;
-    }
-    throw new Error('Unknown line type: ' + JSON.stringify(line));
-}
+function createCompilers(vars) {
+    const { CE, BOX, TEXT } = vars;
 
-function compileAvatar(avatar) {
-    if (avatar.layout === 'column') {
-        const children = avatar.lines.map(compileLine);
-        return `${CE}(${BOX},{flexDirection:"column"},${children.join(',')})`;
+    function compileLine(line) {
+        if (line.ref) {
+            return line.ref;
+        }
+        if (line.segments) {
+            const children = line.segments.map(seg => {
+                const props = { color: seg.color };
+                if (seg.backgroundColor) props.backgroundColor = seg.backgroundColor;
+                return `${CE}(${TEXT},${propsString(props)},"${seg.text}")`;
+            });
+            return `${CE}(${TEXT},null,${children.join(',')})`;
+        }
+        if (line.args) {
+            const argsStr = line.args.map(a => `"${a}"`).join(',');
+            return `${CE}(${TEXT},{color:"${line.color}"},${argsStr})`;
+        }
+        if (line.text !== undefined) {
+            const props = { color: line.color };
+            if (line.backgroundColor) props.backgroundColor = line.backgroundColor;
+            return `${CE}(${TEXT},${propsString(props)},"${line.text}")`;
+        }
+        throw new Error('Unknown line type: ' + JSON.stringify(line));
     }
-    if (avatar.layout === 'row') {
-        const rows = avatar.rows.map(row => {
-            const left = compileLine(row.left);
-            if (row.right) {
-                const right = compileLine(row.right);
-                return `${CE}(${BOX},{flexDirection:"row"},${left},${right})`;
-            }
-            return `${CE}(${BOX},{flexDirection:"row"},${left})`;
-        });
-        return `${CE}(${BOX},{flexDirection:"column"},${rows.join(',')})`;
+
+    function compileAvatar(avatar) {
+        if (avatar.layout === 'column') {
+            const children = avatar.lines.map(compileLine);
+            return `${CE}(${BOX},{flexDirection:"column"},${children.join(',')})`;
+        }
+        if (avatar.layout === 'row') {
+            const rows = avatar.rows.map(row => {
+                const left = compileLine(row.left);
+                if (row.right) {
+                    const right = compileLine(row.right);
+                    return `${CE}(${BOX},{flexDirection:"row"},${left},${right})`;
+                }
+                return `${CE}(${BOX},{flexDirection:"row"},${left})`;
+            });
+            return `${CE}(${BOX},{flexDirection:"column"},${rows.join(',')})`;
+        }
+        throw new Error('Unknown layout: ' + avatar.layout);
     }
-    throw new Error('Unknown layout: ' + avatar.layout);
+
+    return { compileLine, compileAvatar };
 }
 
 // --- Main ---
@@ -76,8 +96,23 @@ if (!avatar) {
     process.exit(1);
 }
 
-// The original unmodified K assignment (backup is restored before each run)
-const SEARCH_PREFIX = 'A[2]===Symbol.for("react.memo_cache_sentinel"))K=';
+let content = fs.readFileSync(cliPath, 'utf8');
+
+// Auto-detect variable names from the current CLI bundle
+const vars = detectVariables(content);
+const { CE, BOX, TEXT, FACE } = vars;
+const { compileAvatar } = createCompilers(vars);
+
+// Find the search prefix dynamically - must be the one near the avatar pattern
+// Look for the memo_cache_sentinel that appears just before the avatar
+const prefixMatch = content.match(/(\w\[\d+\]===Symbol\.for\("react\.memo_cache_sentinel"\)\)\w=)[a-z0-9]+\.createElement\(\w+,\{flexDirection:"column"\},\w+,[a-z0-9]+\.createElement\(\w+,null,[a-z0-9]+\.createElement\(\w+,\{color:"clawd_body"\},"▝▜"\)/);
+if (!prefixMatch) {
+    console.error('Could not find avatar memo cache sentinel pattern in CLI file.');
+    process.exit(1);
+}
+const SEARCH_PREFIX = prefixMatch[1];
+
+// Build the original avatar pattern using detected variables
 const ORIGINAL_AVATAR = [
     `${CE}(${BOX},{flexDirection:"column"},${FACE},`,
     `${CE}(${TEXT},null,`,
@@ -93,15 +128,15 @@ const REPLACEMENT = SEARCH_PREFIX + compiled;
 
 if (dryRun) {
     console.log('Avatar:', avatar.name);
+    console.log('Detected variables:', vars);
     console.log('Compiled:', compiled);
     process.exit(0);
 }
 
-let content = fs.readFileSync(cliPath, 'utf8');
-
 if (!content.includes(SEARCH_PATTERN)) {
     console.error('Search pattern not found in CLI file.');
-    console.error('Is the backup/restore working correctly?');
+    console.error('Detected variables:', vars);
+    console.error('Expected pattern:', SEARCH_PATTERN.substring(0, 100) + '...');
     process.exit(1);
 }
 
@@ -115,10 +150,10 @@ if (!content.includes(compiled)) {
 // Remove the "Welcome back!" banner and give that space to the avatar.
 // The banner sits above the avatar in a fixed-height column (height:5).
 // Removing it and increasing height to 7 gives room for taller avatars.
-const WELCOME_SEARCH = 'createElement(I,{marginTop:1},f8.createElement(V,{bold:!0},n)),f8.createElement(I,{height:5,';
-const WELCOME_REPLACE = 'createElement(I,{height:7,';
-if (content.includes(WELCOME_SEARCH)) {
-    content = content.replace(WELCOME_SEARCH, WELCOME_REPLACE);
+// Pattern is resilient to variable name changes
+const welcomeMatch = content.match(/createElement\(I,\{marginTop:1\},[^)]+\),[a-z0-9]+\.createElement\(\w+,\{bold:!0\}[^)]+\)\),[a-z0-9]+\.createElement\(I,\{height:5,/);
+if (welcomeMatch) {
+    content = content.replace(welcomeMatch[0], 'createElement(I,{height:7,');
 }
 
 fs.writeFileSync(cliPath, content, 'utf8');
